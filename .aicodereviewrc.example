@@ -1,0 +1,6 @@
+{
+  "NEXT_PUBLIC_GOOGLE_CLOUD_PROJECT": "your-google-cloud-project-id",
+  "NEXT_PUBLIC_GOOGLE_CLOUD_LOCATION": "us-central1",
+  "GOOGLE_APPLICATION_CREDENTIALS": "./service-account-key.json",
+  "NEXT_PUBLIC_DEEPSEEK_API_KEY": "your-deepseek-api-key"
+}
