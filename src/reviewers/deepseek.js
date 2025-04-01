@@ -45,10 +45,14 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
   // Calculate optimal chunk size based on code length
   // For larger files, use smaller chunks to avoid timeouts
   const codeLength = code.length;
-  let chunkSize = 2000; // Default to 2000 chars per chunk (reduced from 3000)
+  let chunkSize = 1000; // Default to 1000 chars per chunk (reduced from 2000)
   
   if (codeLength > 10000) {
-    chunkSize = 1500; // Use smaller chunks for larger files
+    chunkSize = 800; // Use even smaller chunks for larger files
+  }
+  
+  if (codeLength > 20000) {
+    chunkSize = 600; // Use tiny chunks for very large files
   }
   
   // Split code into chunks if it's too large
@@ -82,57 +86,79 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
     console.log(`Progress [${progressBar}] - ${completed}/${totalChunks} completed, ${failed} failed, ${retrying} retrying, ${inProgress} in progress`);
   };
   
-  // Process each chunk in parallel
-  for (let i = 0; i < chunks.length; i++) {
-    const processChunk = async () => {
-      try {
-        // Initial attempt
-        chunkStatus[i] = 'in-progress';
-        updateProgress();
-        
-        // Calculate chunk-specific timeout based on chunk size
-        // Larger chunks need more time to process
-        const chunkTimeout = Math.min(
-          timeout, // Don't exceed the user-specified timeout
-          Math.max(
-            timeout * 0.5, // At least 50% of the specified timeout
-            (chunks[i].length / 1000) * 10000 // 10 seconds per 1000 characters
-          )
-        );
-        
-        // Try to process the chunk with retries
-        const chunkResult = await processChunkWithRetry(
-          chunks[i], 
-          focusAreas, 
-          chunkTimeout, 
-          apiKey, 
-          i+1, 
-          totalChunks,
-          (status) => {
-            chunkStatus[i] = status;
-            updateProgress();
-          }
-        );
-        
-        chunkResults.push(chunkResult);
-        chunkStatus[i] = 'completed';
-        updateProgress();
-        return chunkResult;
-      } catch (error) {
-        console.error(`Error processing chunk ${i+1}: ${error.message}`);
-        errors.push({
-          chunkNumber: i+1,
-          error: error.message,
-          code: chunks[i].substring(0, 100) + '...' // First 100 chars for context
-        });
-        chunkStatus[i] = 'failed';
-        updateProgress();
-        return null;
+  // Limit concurrent requests to avoid overwhelming the API
+  const MAX_CONCURRENT = 5;
+  let activePromises = 0;
+  let queueIndex = 0;
+  
+  // Process chunks with concurrency control
+  const processQueue = async () => {
+    while (queueIndex < chunks.length) {
+      if (activePromises >= MAX_CONCURRENT) {
+        // Wait for some promises to complete before continuing
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
       }
-    };
-    
-    chunkPromises.push(processChunk());
-  }
+      
+      const i = queueIndex++;
+      activePromises++;
+      
+      // Process this chunk
+      const processChunk = async () => {
+        try {
+          // Initial attempt
+          chunkStatus[i] = 'in-progress';
+          updateProgress();
+          
+          // Calculate chunk-specific timeout based on chunk size
+          // Larger chunks need more time to process
+          const chunkTimeout = Math.min(
+            timeout, // Don't exceed the user-specified timeout
+            Math.max(
+              timeout * 0.5, // At least 50% of the specified timeout
+              (chunks[i].length / 1000) * 15000 // 15 seconds per 1000 characters (increased from 10)
+            )
+          );
+          
+          // Try to process the chunk with retries
+          const chunkResult = await processChunkWithRetry(
+            chunks[i], 
+            focusAreas, 
+            chunkTimeout, 
+            apiKey, 
+            i+1, 
+            totalChunks,
+            (status) => {
+              chunkStatus[i] = status;
+              updateProgress();
+            }
+          );
+          
+          chunkResults.push(chunkResult);
+          chunkStatus[i] = 'completed';
+          updateProgress();
+          return chunkResult;
+        } catch (error) {
+          console.error(`Error processing chunk ${i+1}: ${error.message}`);
+          errors.push({
+            chunkNumber: i+1,
+            error: error.message,
+            code: chunks[i].substring(0, 100) + '...' // First 100 chars for context
+          });
+          chunkStatus[i] = 'failed';
+          updateProgress();
+          return null;
+        } finally {
+          activePromises--;
+        }
+      };
+      
+      chunkPromises.push(processChunk());
+    }
+  };
+  
+  // Start the processing queue
+  await processQueue();
   
   // Wait for all chunks to be processed
   await Promise.all(chunkPromises);
@@ -143,6 +169,7 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
     throw new Error(errorMessage);
   }
   
+  // If we have at least one successful chunk, proceed with what we have
   // Combine results from all chunks
   const combinedResults = combineChunkResults(chunkResults, focusAreas);
   
@@ -151,6 +178,14 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
     combinedResults.errors = errors;
     combinedResults.partialSuccess = true;
     combinedResults.summary = `⚠️ Note: ${errors.length} of ${totalChunks} chunks failed to process. The review is incomplete.\n\n` + combinedResults.summary;
+    
+    // Add a fallback message if too many chunks failed
+    if (errors.length > totalChunks * 0.7) {
+      combinedResults.summary = `⚠️ WARNING: Most chunks (${errors.length} of ${totalChunks}) failed to process. This review is very incomplete and may not be representative of the full code.\n\n` + combinedResults.summary;
+      
+      // Add recommendation to try again with different settings
+      combinedResults.summary += `\n\nRecommendation: Try again with a longer timeout (--timeout 120) or review smaller portions of the code separately.`;
+    }
   }
   
   // Format the output for better readability
@@ -216,22 +251,18 @@ async function processChunkWithRetry(codeChunk, focusAreas, timeout, apiKey, chu
         BASE_DELAY * Math.pow(2, attempt)
       );
       
-      // Add jitter (±20% randomness)
+      // Add jitter (±20% randomness) to prevent thundering herd problem
       const jitter = 0.2 * exponentialDelay * (Math.random() - 0.5);
-      const delayWithJitter = Math.max(100, exponentialDelay + jitter);
+      const delay = Math.max(1000, exponentialDelay + jitter);
       
-      // Log more detailed error information
-      const errorType = error.name || 'Error';
-      console.log(`Chunk ${chunkNumber} failed (${errorType}): ${error.message}. Retrying in ${Math.round(delayWithJitter/1000)} seconds...`);
-      
-      // Wait before retrying
-      await new Promise(resolve => setTimeout(resolve, delayWithJitter));
+      // Log the retry and wait
+      console.log(`${error.name}: ${error.message}. Retrying in ${Math.round(delay/1000)} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
   
-  // This should never be reached due to the throw in the loop,
-  // but TypeScript might complain without it
-  throw lastError;
+  // This should never be reached, but just in case
+  throw lastError || new Error(`Failed to process chunk ${chunkNumber} after ${MAX_RETRIES} retries`);
 }
 
 /**
@@ -339,7 +370,7 @@ function splitCodeIntoChunks(code, chunkSize) {
     // AND we're at a logical boundary or approaching the chunk size limit,
     // start a new chunk
     const isAtBoundary = boundaryRegex.test(nextLine);
-    const isApproachingLimit = currentChunk.length > chunkSize * 0.8;
+    const isApproachingLimit = currentChunk.length > chunkSize * 0.7; // Reduced from 0.8 to be more aggressive
     
     if (currentChunk.length + line.length > chunkSize && currentChunk.length > 0) {
       chunks.push(currentChunk);
