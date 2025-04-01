@@ -13,7 +13,7 @@ export async function runCLI(args) {
 
   program
     .name('ai-code-review')
-    .description('Dual AI code review tool using DeepSeek and Gemini models')
+    .description('AI code review tool using DeepSeek model')
     .version('0.1.0');
 
   program
@@ -70,17 +70,19 @@ export async function runCLI(args) {
       codeSnippet: options.code,
       focusAreas,
       deepseekTimeout: parseInt(options.timeout, 10) * 1000,
-      skipGemini: true,
       outputFormat: options.output,
       verbose: options.verbose,
       config
     });
 
     // Output is handled by the reviewCode function based on the outputFormat
+    
+    // Explicitly exit with success code after completion
+    process.exit(0);
   } catch (error) {
     console.error(chalk.red(`Error: ${error.message}`));
     if (options.verbose && error.stack) {
-      console.error(chalk.gray(error.stack));
+      console.error(chalk.red(error.stack)); // Changed from gray to red for better visibility
     }
     process.exit(1);
   }
