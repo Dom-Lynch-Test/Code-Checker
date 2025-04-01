@@ -42,11 +42,20 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
     throw new Error('DeepSeek API key not found. Set DEEPSEEK_API_KEY or NEXT_PUBLIC_DEEPSEEK_API_KEY in .env or .aicodereviewrc');
   }
 
+  // Calculate optimal chunk size based on code length
+  // For larger files, use smaller chunks to avoid timeouts
+  const codeLength = code.length;
+  let chunkSize = 2000; // Default to 2000 chars per chunk (reduced from 3000)
+  
+  if (codeLength > 10000) {
+    chunkSize = 1500; // Use smaller chunks for larger files
+  }
+  
   // Split code into chunks if it's too large
-  const chunks = splitCodeIntoChunks(code, 3000); // ~3000 chars per chunk
+  const chunks = splitCodeIntoChunks(code, chunkSize);
   const totalChunks = chunks.length;
   
-  console.log(`Code split into ${totalChunks} chunks for DeepSeek review`);
+  console.log(`Code split into ${totalChunks} chunks for DeepSeek review (${codeLength} total characters)`);
   
   // Process chunks in parallel with progress tracking
   const chunkResults = [];
@@ -81,11 +90,21 @@ export async function reviewWithDeepseek({ code, focusAreas, timeout, config }) 
         chunkStatus[i] = 'in-progress';
         updateProgress();
         
+        // Calculate chunk-specific timeout based on chunk size
+        // Larger chunks need more time to process
+        const chunkTimeout = Math.min(
+          timeout, // Don't exceed the user-specified timeout
+          Math.max(
+            timeout * 0.5, // At least 50% of the specified timeout
+            (chunks[i].length / 1000) * 10000 // 10 seconds per 1000 characters
+          )
+        );
+        
         // Try to process the chunk with retries
         const chunkResult = await processChunkWithRetry(
           chunks[i], 
           focusAreas, 
-          timeout, 
+          chunkTimeout, 
           apiKey, 
           i+1, 
           totalChunks,
@@ -216,68 +235,6 @@ async function processChunkWithRetry(codeChunk, focusAreas, timeout, apiKey, chu
 }
 
 /**
- * Enhances the output format for better readability
- * @param {Object} results - Review results to enhance
- */
-function enhanceOutputFormat(results) {
-  // Add a quick summary section at the top
-  const issueCount = results.issueCount || {
-    critical: results.issues?.critical?.length || 0,
-    high: results.issues?.high?.length || 0,
-    medium: results.issues?.medium?.length || 0,
-    low: results.issues?.low?.length || 0
-  };
-  
-  const totalIssues = issueCount.critical + issueCount.high + issueCount.medium + issueCount.low;
-  
-  // Count successful retries
-  let retrySuccessCount = 0;
-  if (results.chunkResults) {
-    retrySuccessCount = results.chunkResults.filter(chunk => chunk && chunk.retrySuccess).length;
-  }
-  
-  // Create a quick stats summary
-  const quickStats = `
-## Quick Stats
-- **Total Issues**: ${totalIssues}
-- **Critical**: ${issueCount.critical}
-- **High**: ${issueCount.high}
-- **Medium**: ${issueCount.medium}
-- **Low**: ${issueCount.low}
-- **Focus Areas**: ${results.focusAreas.join(', ')}
-- **Chunks Processed**: ${results.processedChunks || 1}/${results.totalChunks || 1}
-${retrySuccessCount > 0 ? `- **Chunks Recovered**: ${retrySuccessCount} (via retry mechanism)` : ''}
-`;
-  
-  // Create a key issues section that highlights critical and high issues
-  let keyIssues = '';
-  
-  if (issueCount.critical > 0 || issueCount.high > 0) {
-    keyIssues = `
-## Key Issues to Address
-
-${issueCount.critical > 0 ? `### Critical Issues
-${results.issues.critical.map((issue, i) => `${i+1}. ${issue}`).join('\n')}
-` : ''}
-
-${issueCount.high > 0 ? `### High Priority Issues
-${results.issues.high.map((issue, i) => `${i+1}. ${issue}`).join('\n')}
-` : ''}
-`;
-  }
-  
-  // Combine all sections
-  results.summary = quickStats + keyIssues + '\n**\n\n' + results.summary;
-  
-  // Add retry information to the summary if applicable
-  if (retrySuccessCount > 0) {
-    results.summary += `\n\n**Note:** ${retrySuccessCount} chunk(s) initially failed but were successfully recovered through the automatic retry mechanism.`;
-  }
-  
-  return results;
-}
-
-/**
  * Reviews a single chunk of code
  * @param {string} codeChunk - Code chunk to review
  * @param {string[]} focusAreas - Focus areas for the review
@@ -371,12 +328,28 @@ function splitCodeIntoChunks(code, chunkSize) {
   const chunks = [];
   let currentChunk = '';
   
-  for (const line of lines) {
+  // Try to split at logical boundaries (function/class definitions, large comment blocks)
+  const boundaryRegex = /^(\s*\/\*\*|\s*class\s+|\s*function\s+|\s*const\s+\w+\s*=\s*function|\s*export\s+|\s*import\s+)/;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const nextLine = i < lines.length - 1 ? lines[i + 1] : '';
+    
     // If adding this line would exceed chunk size and we already have content,
+    // AND we're at a logical boundary or approaching the chunk size limit,
     // start a new chunk
+    const isAtBoundary = boundaryRegex.test(nextLine);
+    const isApproachingLimit = currentChunk.length > chunkSize * 0.8;
+    
     if (currentChunk.length + line.length > chunkSize && currentChunk.length > 0) {
       chunks.push(currentChunk);
       currentChunk = line + '\n';
+    } else if (isAtBoundary && isApproachingLimit && currentChunk.length > 0) {
+      // If we're at a logical boundary and approaching the chunk size limit,
+      // finish the current chunk and start a new one
+      currentChunk += line + '\n';
+      chunks.push(currentChunk);
+      currentChunk = '';
     } else {
       currentChunk += line + '\n';
     }
@@ -616,6 +589,68 @@ function combineChunkResults(chunkResults, focusAreas) {
     processedChunks: chunkResults.length,
     totalChunks: chunkResults[0].totalChunks
   };
+}
+
+/**
+ * Enhances the output format for better readability
+ * @param {Object} results - Review results to enhance
+ */
+function enhanceOutputFormat(results) {
+  // Add a quick summary section at the top
+  const issueCount = results.issueCount || {
+    critical: results.issues?.critical?.length || 0,
+    high: results.issues?.high?.length || 0,
+    medium: results.issues?.medium?.length || 0,
+    low: results.issues?.low?.length || 0
+  };
+  
+  const totalIssues = issueCount.critical + issueCount.high + issueCount.medium + issueCount.low;
+  
+  // Count successful retries
+  let retrySuccessCount = 0;
+  if (results.chunkResults) {
+    retrySuccessCount = results.chunkResults.filter(chunk => chunk && chunk.retrySuccess).length;
+  }
+  
+  // Create a quick stats summary
+  const quickStats = `
+## Quick Stats
+- **Total Issues**: ${totalIssues}
+- **Critical**: ${issueCount.critical}
+- **High**: ${issueCount.high}
+- **Medium**: ${issueCount.medium}
+- **Low**: ${issueCount.low}
+- **Focus Areas**: ${results.focusAreas.join(', ')}
+- **Chunks Processed**: ${results.processedChunks || 1}/${results.totalChunks || 1}
+${retrySuccessCount > 0 ? `- **Chunks Recovered**: ${retrySuccessCount} (via retry mechanism)` : ''}
+`;
+  
+  // Create a key issues section that highlights critical and high issues
+  let keyIssues = '';
+  
+  if (issueCount.critical > 0 || issueCount.high > 0) {
+    keyIssues = `
+## Key Issues to Address
+
+${issueCount.critical > 0 ? `### Critical Issues
+${results.issues.critical.map((issue, i) => `${i+1}. ${issue}`).join('\n')}
+` : ''}
+
+${issueCount.high > 0 ? `### High Priority Issues
+${results.issues.high.map((issue, i) => `${i+1}. ${issue}`).join('\n')}
+` : ''}
+`;
+  }
+  
+  // Combine all sections
+  results.summary = quickStats + keyIssues + '\n**\n\n' + results.summary;
+  
+  // Add retry information to the summary if applicable
+  if (retrySuccessCount > 0) {
+    results.summary += `\n\n**Note:** ${retrySuccessCount} chunk(s) initially failed but were successfully recovered through the automatic retry mechanism.`;
+  }
+  
+  return results;
 }
 
 /**
